@@ -1,136 +1,91 @@
-import gradio as gr
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
-import numpy as np
 import os
+from types import SimpleNamespace
 import random
-import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
+from torchvision.utils import save_image
+import gradio as gr
+import numpy as np
+import io
+import tempfile  # Importar tempfile
+import math
 
-# DEFINICIÓN DE BLOQUES DE RED
+# Asegúrate de que las funciones necesarias estén definidas (si no lo están ya)
+def resize(img, size):
+    return F.interpolate(img, size=size, mode='bilinear', align_corners=False)
+
+def denormalize(x):
+    return (x + 1) / 2  # Valores en [0, 1]
+
+# Definición de las clases de los modelos (Generator, StyleEncoder, MappingNetwork, ResBlk, AdaIN, AdainResBlk)
 class ResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, normalize=False, downsample=False):
         super().__init__()
-        self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
-        self.norm1 = nn.InstanceNorm2d(dim_out, affine=True) if normalize else None
-        self.relu1 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
-        self.norm2 = nn.InstanceNorm2d(dim_out, affine=True) if normalize else None
-        self.relu2 = nn.ReLU(inplace=True)
+        self.normalize = normalize
         self.downsample = downsample
-        if self.downsample:
-            self.avg_pool = nn.AvgPool2d(2)
+        self.main = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, 1),
+            nn.InstanceNorm2d(dim_out, affine=True) if normalize else nn.Identity(),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim_out, dim_out, 3, 1, 1),
+            nn.InstanceNorm2d(dim_out, affine=True) if normalize else nn.Identity()
+        )
+        self.downsample_layer = nn.AvgPool2d(2) if downsample else nn.Identity()
+        self.skip = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False)
 
     def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        if self.norm1:
-            out = self.norm1(out)
-        out = self.relu1(out)
-        out = self.conv2(out)
-        if self.norm2:
-            out = self.norm2(out)
-        out = self.relu2(out)
-        if self.downsample:
-            out = self.avg_pool(out)
-            residual = self.avg_pool(residual)
-        out = out + residual
-        return out
-
-class AdainResBlk(nn.Module):
-    def __init__(self, dim_in, dim_out, style_dim, upsample=False):
-        super().__init__()
-        self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
-        self.norm1 = AdaIN(dim_out, style_dim)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
-        self.norm2 = AdaIN(dim_out, style_dim)
-        self.relu2 = nn.ReLU(inplace=True)
-        self.upsample = upsample
-
-    def forward(self, x, s):
-        residual = x
-        if self.upsample:
-            residual = F.interpolate(residual, scale_factor=2, mode='nearest')
-        out = self.conv1(x)
-        out = self.norm1(out, s)
-        out = self.relu1(out)
-        if self.upsample:
-            out = F.interpolate(out, scale_factor=2, mode='nearest')
-        out = self.conv2(out)
-        out = self.norm2(out, s)
-        out = self.relu2(out)
-        out = out + residual
-        return out
+        out = self.main(x)
+        out = self.downsample_layer(out)
+        skip = self.skip(x)
+        skip = self.downsample_layer(skip)
+        return (out + skip) / math.sqrt(2)
 
 class AdaIN(nn.Module):
     def __init__(self, num_features, style_dim):
-        super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features, affine=False)
+        super(AdaIN, self).__init__()
         self.fc = nn.Linear(style_dim, num_features * 2)
 
     def forward(self, x, s):
         h = self.fc(s)
-        gamma, beta = torch.chunk(h, 2, dim=1)
+        gamma, beta = torch.chunk(h, chunks=2, dim=1)
         gamma = gamma.unsqueeze(2).unsqueeze(3)
         beta = beta.unsqueeze(2).unsqueeze(3)
-        return (1 + gamma) * self.norm(x) + beta
+        return (1 + gamma) * x + beta
 
-class MappingNetwork(nn.Module):
-    def __init__(self, latent_dim, style_dim, num_domains):
+class AdainResBlk(nn.Module):
+    def __init__(self, dim_in, dim_out, style_dim=64, w_hpf=1, upsample=False):
         super().__init__()
-        layers = []
-        layers += [nn.Linear(latent_dim + num_domains, 512)]
-        layers += [nn.ReLU()]
-        for _ in range(3):
-            layers += [nn.Linear(512, 512)]
-            layers += [nn.ReLU()]
-        self.shared = nn.Sequential(*layers)
-        self.unshared = nn.ModuleList()
-        for _ in range(num_domains):
-            self.unshared += [nn.Linear(512, style_dim)]
+        self.upsample = upsample
+        self.w_hpf = w_hpf
+        self.norm1 = AdaIN(dim_in, style_dim)
+        self.norm2 = AdaIN(dim_out, style_dim)
+        self.actv = nn.LeakyReLU(0.2)
+        self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
+        self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
+        if dim_in != dim_out:
+            self.skip = nn.Conv2d(dim_in, dim_out, 1, 1, 0)
+        else:
+            self.skip = nn.Identity()
 
-    def forward(self, z, y):
-        h = torch.cat([z, y], dim=1)
-        h = self.shared(h)
-        out = []
-        for layer in self.unshared:
-            out += [layer(h)]
-        out = torch.stack(out, dim=1) # (batch, num_domains, style_dim)
-        idx = torch.LongTensor(range(y.size(0))).unsqueeze(1).to(y.device)
-        s = torch.gather(out, 1, idx.unsqueeze(2).expand(-1, -1, out.size(2))).squeeze(1)
-        return s
+    def forward(self, x, s):
+        x_orig = x
+        if self.upsample:
+            x = F.interpolate(x, scale_factor=2, mode='nearest')
+            x_orig = F.interpolate(x_orig, scale_factor=2, mode='nearest')
+        h = self.norm1(x, s)
+        h = self.actv(h)
+        h = self.conv1(h)
+        h = self.norm2(h, s)
+        h = self.actv(h)
+        h = self.conv2(h)
+        skip = self.skip(x_orig)
+        out = (h + skip) / math.sqrt(2)
+        return out
 
-class StyleEncoder(nn.Module):
-    def __init__(self, img_size=256, style_dim=64, num_domains=3, max_conv_dim=512):
-        super().__init__()
-        dim_in = 64
-        blocks = []
-        blocks += [nn.Conv2d(3, dim_in, 3, 1, 1)]
-        repeat_num = int(np.log2(img_size)) - 2
-        for _ in range(repeat_num):
-            dim_out = min(dim_in*2, max_conv_dim)
-            blocks += [ResBlk(dim_in, dim_out, downsample=True)]
-            dim_in = dim_out
-        self.shared = nn.Sequential(*blocks)
-        self.unshared = nn.ModuleList()
-        for _ in range(num_domains):
-            self.unshared += [nn.Linear(dim_in * (img_size // (2**repeat_num))**2, style_dim)]
-
-    def forward(self, x, y):
-        h = self.shared(x)
-        h = h.view(h.size(0), -1)
-        out = []
-        for layer in self.unshared:
-            out += [layer(h)]
-        out = torch.stack(out, dim=1) # (batch, num_domains, style_dim)
-        idx = torch.LongTensor(range(y.size(0))).unsqueeze(1).to(y.device)
-        s = torch.gather(out, 1, idx.unsqueeze(2).expand(-1, -1, out.size(2))).squeeze(1)
-        return s
-
-# DEFINICIÓN DEL GENERADOR
 class Generator(nn.Module):
     def __init__(self, img_size=256, style_dim=64, max_conv_dim=512):
         super().__init__()
@@ -143,7 +98,6 @@ class Generator(nn.Module):
             blocks += [ResBlk(dim_in, dim_out, normalize=True, downsample=True)]
             dim_in = dim_out
         self.encode = nn.Sequential(*blocks)
-
         self.decode = nn.ModuleList()
         for _ in range(repeat_num):
             dim_out = dim_in // 2
@@ -162,79 +116,220 @@ class Generator(nn.Module):
         out = self.to_rgb(x)
         return out
 
-# FUNCIÓN PARA CARGAR EL MODELO
-def load_pretrained_model(ckpt_path, img_size=256, style_dim=64, num_domains=3, device='cpu'):
-    G = Generator(img_size, style_dim).to(device)
-    M = MappingNetwork(16, style_dim, num_domains).to(device) # Suponiendo latent_dim=16
-    S = StyleEncoder(img_size, style_dim, num_domains).to(device)
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    G.load_state_dict(checkpoint['generator'])
-    M.load_state_dict(checkpoint['mapping_network'])
-    S.load_state_dict(checkpoint['style_encoder'])
-    G.eval()
-    S.eval()
-    return G, S
+class MappingNetwork(nn.Module):
+    def __init__(self, latent_dim=16, style_dim=64, num_domains=2, hidden_dim=512):
+        super(MappingNetwork, self).__init__()
+        layers = [
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU()
+        ]
+        for _ in range(3):
+            layers += [
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU()
+            ]
+        self.shared = nn.Sequential(*layers)
+        self.unshared = nn.ModuleList()
+        for _ in range(num_domains):
+            self.unshared.append(nn.Linear(hidden_dim, style_dim))
 
-# FUNCIÓN PARA COMBINAR ESTILOS
-def combine_styles(source_image, reference_image, generator, style_encoder, target_domain_idx, device='cpu'):
+    def forward(self, z, y):
+        h = self.shared(z)
+        out = []
+        for layer in self.unshared:
+            out.append(layer(h))
+        out = torch.stack(out, dim=1)
+        idx = torch.arange(y.size(0)).to(y.device)
+        s = out[idx, y]
+        return s
+
+class StyleEncoder(nn.Module):
+    def __init__(self, img_size=256, style_dim=64, num_domains=2, max_conv_dim=512):
+        super().__init__()
+        dim_in = 64
+        blocks = []
+        blocks += [nn.Conv2d(3, dim_in, 3, 1, 1)]
+        repeat_num = int(np.log2(img_size)) - 2
+        for _ in range(repeat_num):
+            dim_out = min(dim_in*2, max_conv_dim)
+            blocks += [ResBlk(dim_in, dim_out, normalize=True, downsample=True)]
+            dim_in = dim_out
+        blocks += [nn.LeakyReLU(0.2)]
+        self.shared = nn.Sequential(*blocks)
+        self.unshared = nn.ModuleList()
+        for _ in range(num_domains):
+            self.unshared += [nn.Linear(dim_in, style_dim)]
+
+    def forward(self, x, y):
+        h = self.shared(x)
+        h = F.adaptive_avg_pool2d(h, (1,1))
+        h = h.view(h.size(0), -1)
+        out = []
+        for layer in self.unshared:
+            out += [layer(h)]
+        out = torch.stack(out, dim=1)
+        idx = torch.arange(y.size(0)).to(y.device)
+        s = out[idx, y]
+        return s
+
+# Clase para cargar imagenes
+class ImageFolder(Dataset):
+    def __init__(self, root, transform, mode, which='source'):
+        self.transform = transform
+        self.paths = []
+        domains = sorted(os.listdir(root))
+        for domain in domains:
+            if os.path.isdir(os.path.join(root, domain)):
+                files = os.listdir(os.path.join(root, domain))
+                files = [os.path.join(root, domain, f) for f in files]
+                self.paths += [(f, domains.index(domain)) for f in files]
+        if mode == 'train' and which == 'reference':
+            random.shuffle(self.paths)
+
+    def __getitem__(self, index):
+        path, label = self.paths[index]
+        img = Image.open(path).convert('RGB')
+        return self.transform(img), label
+
+    def __len__(self):
+        return len(self.paths)
+
+# Funciones para obtener los data loaders
+def get_transform(img_size, mode='train', prob=0.5):
+    transform = []
+    transform.append(transforms.Resize((img_size, img_size)))
+    if mode == 'train':
+        transform.append(transforms.RandomHorizontalFlip())
+        transform.append(transforms.RandomApply([
+            transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0))
+        ], p=prob))
+    transform.append(transforms.ToTensor())
+    transform.append(transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                                         std=[0.5, 0.5, 0.5]))
+    return transforms.Compose(transform)
+
+def get_train_loader(root, which='source', img_size=256, batch_size=8, prob=0.5, num_workers=4):
     transform = transforms.Compose([
-        transforms.Resize((256, 256)), # Ajustar al tamaño de entrada de tu modelo
+        transforms.Resize((img_size, img_size)),
+        transforms.RandomHorizontalFlip(p=prob),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
+    dataset = ImageFolder(root=root, transform=transform, mode=which)
+    loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
+    return loader
 
-    source_img = transform(source_image).unsqueeze(0).to(device)
-    reference_img = transform(reference_image).unsqueeze(0).to(device)
-    target_domain = torch.tensor([target_domain_idx]).unsqueeze(0).to(device) # Crear un tensor para el dominio objetivo
+def get_test_loader(root, img_size=256, batch_size=8, shuffle=False, num_workers=4, mode='reference'):
+    transform = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    dataset = ImageFolder(root=root, transform=transform, mode=mode)
+    loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, drop_last=False)
+    return loader
 
-    with torch.no_grad():
-        style_ref = style_encoder(reference_img, target_domain) # Usar el mismo índice de dominio que la referencia
-        generated_image = generator(source_img, style_ref)
-        generated_image = (generated_image + 1) / 2.0 # Desnormalizar a [0, 1]
-        generated_image = generated_image.squeeze(0).cpu().permute(1, 2, 0).numpy()
-        generated_image = (generated_image * 255).astype(np.uint8)
-        return Image.fromarray(generated_image)
+# Clase Solver (adaptada para la inferencia)
+class Solver(object):
+    def __init__(self, args):
+        self.args = args
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# CONFIGURACIÓN DE GRADIO
-def create_interface(generator, style_encoder, domain_names, device='cpu'):
-    def predict(source_img, ref_img, target_domain):
-        target_domain_idx = domain_names.index(target_domain)
-        return combine_styles(source_img, ref_img, generator, style_encoder, target_domain_idx, device)
+        # Definir los modelos
+        self.G = Generator(args.img_size, args.style_dim).to(self.device)
+        self.M = MappingNetwork(args.latent_dim, args.style_dim, args.num_domains).to(self.device)
+        self.S = StyleEncoder(args.img_size, args.style_dim, args.num_domains).to(self.device)
+
+    def load_checkpoint(self, checkpoint_path):
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            self.G.load_state_dict(checkpoint['generator'])
+            self.M.load_state_dict(checkpoint['mapping_network'])
+            self.S.load_state_dict(checkpoint['style_encoder'])
+            print(f"Checkpoint cargado exitosamente desde {checkpoint_path}.")
+        except FileNotFoundError:
+            print(f"Error: No se encontró el checkpoint en {checkpoint_path}.")
+            raise FileNotFoundError(f"No se encontró el checkpoint en {checkpoint_path}")
+        except Exception as e:
+            print(f"Error al cargar el checkpoint: {e}.")
+            raise Exception(f"Error al cargar el checkpoint: {e}")
+
+    def transfer_style(self, source_image, reference_image):
+        # Asegúrate de que los modelos estén en modo de evaluación
+        self.G.eval()
+        self.S.eval()
+
+        with torch.no_grad():
+            # Preprocesar las imágenes de entrada
+            transform = transforms.Compose([
+                transforms.Resize((self.args.img_size, self.args.img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            ])
+            # Convertir a PIL image antes de la transformación
+            source_image_pil = Image.fromarray(source_image)
+            reference_image_pil = Image.fromarray(reference_image)
+
+            source_image = transform(source_image_pil).unsqueeze(0).to(self.device)
+            reference_image = transform(reference_image_pil).unsqueeze(0).to(self.device)
+
+            # Codificar el estilo de la imagen de referencia
+            s_ref = self.S(reference_image, torch.tensor([0]).to(self.device))
+
+            # Generar la imagen con el estilo transferido
+            generated_image = self.G(source_image, s_ref)
+
+            # Denormalizar la imagen para mostrarla en la interfaz
+            generated_image = denormalize(generated_image.squeeze(0)).cpu()
+            return (generated_image * 255).clamp(0, 255).byte().permute(1, 2, 0).numpy() # Convertir a NumPy y a rango válido
+
+# Función principal para la inferencia
+def main(source_image, reference_image, checkpoint_path, args):
+    if source_image is None or reference_image is None:
+        raise gr.Error("Por favor, proporciona ambas imágenes (fuente y referencia).")
+
+    # Crear el solver
+    solver = Solver(args)
+    # Cargar el checkpoint
+    solver.load_checkpoint(checkpoint_path)
+
+    # Realizar la transferencia de estilo
+    generated_image = solver.transfer_style(source_image, reference_image)
+    return generated_image
+
+def gradio_interface():
+    # Definir los argumentos (ajustados para la inferencia)
+    args = SimpleNamespace(
+        img_size=128,
+        num_domains=3,
+        latent_dim=16,
+        style_dim=64,
+        num_workers=0,
+        seed=8365,
+    )
+
+    # Ruta al checkpoint
+    checkpoint_path = "iter/20500_nets_ema.ckpt"
+
+    # Crear la interfaz de Gradio
+    inputs = [
+        gr.Image(label="Source Image (Car to change style)"),
+        gr.Image(label="Reference Image (Style to transfer)"),
+    ]
+    outputs = gr.Image(label="Generated Image (Car with transferred style)")
+
+    title = "AutoStyleGAN: Car Style Transfer"
+    description = "Transfer the style of one car to another. Upload a source car image and a reference car image."
 
     iface = gr.Interface(
-        fn=predict,
-        inputs=[
-            gr.Image(label="Imagen Fuente"),
-            gr.Image(label="Imagen de Referencia"),
-            gr.Dropdown(choices=domain_names, label="Dominio de Referencia (para el estilo)"),
-        ],
-        outputs=gr.Image(label="Imagen Generada"),
-        title="AutoStyleGAN - Transferencia de Estilo de Carros",
-        description="Selecciona una imagen de carro fuente y una imagen de carro de referencia para transferir el estilo de la referencia a la fuente."
+        fn=lambda source_image, reference_image: main(source_image, reference_image, checkpoint_path, args),
+        inputs=inputs,
+        outputs=outputs,
+        title=title,
+        description=description,
     )
     return iface
 
 if __name__ == '__main__':
-    #CARGAR EL MODELO ENTRENADO
-    checkpoint_path = 'AutoStyleGAN/expr/checkpoints/9500_nets_ema.ckpt'
-    img_size = 128
-    style_dim = 64 
-    num_domains = 3 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    try:
-        generator, style_encoder = load_pretrained_model(checkpoint_path, img_size, style_dim, num_domains, device)
-        print("Modelo cargado exitosamente.")
-
-        #DEFINIR LOS NOMBRES DE LOS DOMINIOS
-        # ¡Reemplaza con los nombres reales de tus dominios (carpetas)!
-        domain_names = ["BMW", "Corvette", "Mazda"]
-
-        #  CREAR E LANZAR LA INTERFAZ DE GRADIO 
-        iface = create_interface(generator, style_encoder, domain_names, device)
-        iface.launch(share=True)
-
-    except FileNotFoundError:
-        print(f"Error: No se encontró el archivo de checkpoint en '{checkpoint_path}'. Asegúrate de proporcionar la ruta correcta.")
-    except Exception as e:
-        print(f"Ocurrió un error al cargar el modelo: {e}")
+    iface = gradio_interface()
+    iface.launch(share=True)
